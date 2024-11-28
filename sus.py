@@ -99,7 +99,7 @@ def fetch_proxies():
 
 async def main():
     try:
-        _user_id = "2p4GgmhEwvn4B8NPpwyxHnAbzjk"
+        _user_id = "2p4NbqPTWP37Q65LB3spmgHTT2B"
         if not _user_id:
             return
         print(f"User ID read from file: {_user_id}")
