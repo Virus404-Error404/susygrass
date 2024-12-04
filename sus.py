@@ -1,26 +1,30 @@
-import asyncio
-import random
 import ssl
 import json
 import time
 import uuid
+import random
+import asyncio
+import threading
 import requests
-import shutil
 from loguru import logger
-from websockets_proxy import Proxy, proxy_connect
 from fake_useragent import UserAgent
+from websockets_proxy import Proxy, proxy_connect
+from queue import Queue
+
+total_proxies_fetched = 0
+lock = threading.Lock()
+proxy_queue = Queue()
 
 async def connect_to_wss(socks5_proxy, user_id):
     user_agent = UserAgent(os=['windows', 'macos', 'linux'], browsers='chrome')
     random_user_agent = user_agent.random
     device_id = str(uuid.uuid3(uuid.NAMESPACE_DNS, socks5_proxy))
-    logger.info(device_id)
+    logger.info(f"Connecting using proxy: {socks5_proxy}")
+
     while True:
         try:
             await asyncio.sleep(random.randint(1, 10) / 10)
-            custom_headers = {
-                "User-Agent": random_user_agent,
-            }
+            custom_headers = {"User-Agent": random_user_agent}
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
@@ -28,6 +32,7 @@ async def connect_to_wss(socks5_proxy, user_id):
             uri = random.choice(urilist)
             server_hostname = "proxy2.wynd.network"
             proxy = Proxy.from_url(socks5_proxy)
+
             async with proxy_connect(uri, proxy=proxy, ssl=ssl_context, server_hostname=server_hostname,
                                      extra_headers=custom_headers) as websocket:
                 async def send_ping():
@@ -35,17 +40,17 @@ async def connect_to_wss(socks5_proxy, user_id):
                         send_message = json.dumps({
                             "id": str(uuid.uuid4()), "version": "1.0.0", "action": "PING", "data": {}
                         })
-                        logger.debug(send_message)
+                        logger.debug(f"Sending PING: {send_message}")
                         await websocket.send(send_message)
-                        await asyncio.sleep(5)
+                        await asyncio.sleep(4)
 
-                await asyncio.sleep(1)
                 asyncio.create_task(send_ping())
 
                 while True:
                     response = await websocket.recv()
                     message = json.loads(response)
-                    logger.info(message)
+                    logger.info(f"Received message: {message}")
+
                     if message.get("action") == "AUTH":
                         auth_response = {
                             "id": message["id"],
@@ -59,72 +64,138 @@ async def connect_to_wss(socks5_proxy, user_id):
                                 "version": "4.29.0",
                             }
                         }
-                        logger.debug(auth_response)
+                        logger.debug(f"Sending AUTH: {auth_response}")
                         await websocket.send(json.dumps(auth_response))
 
                     elif message.get("action") == "PONG":
                         pong_response = {"id": message["id"], "origin_action": "PONG"}
-                        logger.debug(pong_response)
+                        logger.debug(f"Sending PONG: {pong_response}")
                         await websocket.send(json.dumps(pong_response))
-        except Exception as e:
-            proxy_to_remove = socks5_proxy
-            with open('auto_proxies.txt', 'r') as file:
-                lines = file.readlines()
-            updated_lines = [line for line in lines if line.strip() != proxy_to_remove]
-            with open('auto_proxies.txt', 'w') as file:
-                file.writelines(updated_lines)
-            print(f"Proxy '{proxy_to_remove}' has been removed from the file.")
 
-def fetch_proxies():
-    """Fetches proxies from the API and saves them to 'auto_proxies.txt'."""
-    api_url = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
-    try:
-        response = requests.get(api_url, stream=True)
-        if response.status_code == 200:
-            proxies = response.text.strip().splitlines()
-            if proxies:
-                with open('auto_proxies.txt', 'w') as f:
-                    f.writelines([proxy + '\n' for proxy in proxies])
-                print(f"Fetched and saved {len(proxies)} proxies to 'auto_proxies.txt'.")
+        except Exception as e:
+            logger.error(f"Connection failed with proxy {socks5_proxy}: {e}")
+            with open('auto_proxies.txt', 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+            updated_lines = [line for line in lines if line.strip() != socks5_proxy]
+            with open('auto_proxies.txt', 'w', encoding='utf-8') as file:
+                file.writelines(updated_lines)
+            logger.info(f"Proxy '{socks5_proxy}' has been removed from the file.")
+            break
+
+def fetch_proxies_from_multiple_sources():
+    global total_proxies_fetched
+    proxies = set()
+
+    def fetch_from_url(url, prefix):
+        try:
+            if not "proxylist.geonode.com" in url:
+                response = requests.get(url)
+                response.raise_for_status()
+                proxy_list = response.text.splitlines()
+                for proxy in proxy_list:
+                    if not "://" in proxy:
+                        proxies.update(f"{prefix}://{proxy}")
+                    else:
+                        proxies.update(f"{proxy}")
+                logger.info(f"Fetched {len(proxy_list)} proxies from {url}")
             else:
-                print("No proxies found from the API.")
-                return False
-        else:
-            print(f"Failed to fetch proxies. Status code: {response.status_code}")
-            return False
+                base_url = "https://proxylist.geonode.com/api/proxy-list?limit=500&page={}&sort_by=lastChecked&sort_type=desc"
+                all_proxies = set()
+
+                for page_num in range(1, 15):
+                    url = base_url.format(page_num)
+                    try:
+                        response = requests.get(url, timeout=10)
+                        response.raise_for_status()
+                        data = response.json()
+
+                        for proxy in data.get("data", []):
+                            ip = proxy.get("ip")
+                            port = proxy.get("port")
+                            protocols = proxy.get("protocols", [])
+
+                            if ip and port:
+                                for protocol in protocols:
+                                    proxies.update(f"{protocol}://{ip}:{port}")
+                        logger.info(f"Fetched proxies from page {page_num}")
+                    except requests.RequestException as e:
+                        logger.error(f"Error fetching data from page {page_num}: {e}")
+        except requests.RequestException as e:
+            logger.error(f"Error fetching proxies from {url}: {e}")
+
+    proxy_urls = [
+        ("https://api.openproxylist.xyz/http.txt", "http"),
+        ("https://api.openproxylist.xyz/socks4.txt", "socks4"),
+        ("https://api.openproxylist.xyz/socks5.txt", "socks5"),
+        ("https://www.proxy-list.download/api/v1/get?type=socks5", "socks5"),
+        ("https://www.proxy-list.download/api/v1/get?type=socks4", "socks4"),
+        ("https://www.proxy-list.download/api/v1/get?type=http", "http"),
+        ("https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_format=protocolipport", ""),
+        ("https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc", "")
+    ]
+
+    threads = []
+    for url, prefix in proxy_urls:
+        thread = threading.Thread(target=fetch_from_url, args=(url, prefix))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    logger.info(f"Total proxies fetched: {len(proxies)}")
+    return list(proxies)
+
+def save_proxies(proxies):
+    try:
+        with open("auto_proxies.txt", "a", encoding='utf-8') as f:
+            f.write("\n".join(proxies) + "\n")
+        logger.info(f"Saved {len(proxies)} new proxies to 'auto_proxies.txt'.")
     except Exception as e:
-        print(f"Error fetching proxies: {e}")
-        return False
-    return True
+        logger.error(f"Error saving proxies: {e}")
+
+def check_proxies():
+    while True:
+        proxy = proxy_queue.get()
+        if proxy is None:
+            break
+
+        logger.info(f"Checking proxy {proxy}")
+        asyncio.run(connect_to_wss(proxy, user_id="2p4GgmhEwvn4B8NPpwyxHnAbzjk"))
+        time.sleep(0.01)
+
+        proxy_queue.task_done()
 
 async def main():
-    try:
-        _user_id = "2p4GgmhEwvn4B8NPpwyxHnAbzjk"
-        if not _user_id:
-            return
-        print(f"User ID read from file: {_user_id}")
-    except FileNotFoundError:
-        print("Error: 'user_id.txt' file not found.")
+    proxies = fetch_proxies_from_multiple_sources()
+    if not proxies:
+        logger.error("No proxies fetched. Exiting script.")
         return
 
-    # Fetch and save proxies to 'auto_proxies.txt'
-    if not fetch_proxies():
-        print("No proxies available. Exiting script.")
-        return
+    save_proxies(proxies)
 
     try:
-        with open('auto_proxies.txt', 'r') as file:
+        with open('auto_proxies.txt', 'r', encoding='utf-8') as file:
             auto_proxy_list = file.read().splitlines()
             if not auto_proxy_list:
-                print("No proxies found in 'auto_proxies.txt'. Exiting script.")
+                logger.error("No proxies found in 'auto_proxies.txt'. Exiting script.")
                 return
-            print(f"Proxies read from file: {auto_proxy_list}")
+            logger.info(f"Proxies read from file: {auto_proxy_list}")
     except FileNotFoundError:
-        print("Error: 'auto_proxies.txt' file not found.")
+        logger.error("Error: 'auto_proxies.txt' file not found.")
         return
 
-    tasks = [asyncio.ensure_future(connect_to_wss(i, _user_id)) for i in auto_proxy_list]
-    await asyncio.gather(*tasks)
+    for proxy in auto_proxy_list:
+        proxy_queue.put(proxy)
+
+    threads = []
+    for i in range(500):
+        thread = threading.Thread(target=check_proxies)
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
 
 if __name__ == '__main__':
     asyncio.run(main())
