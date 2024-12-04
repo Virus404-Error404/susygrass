@@ -20,7 +20,6 @@ async def connect_to_wss(socks5_proxy, user_id):
     random_user_agent = user_agent.random
     device_id = str(uuid.uuid3(uuid.NAMESPACE_DNS, socks5_proxy))
     logger.info(f"Connecting using proxy: {socks5_proxy}")
-
     while True:
         try:
             await asyncio.sleep(random.randint(1, 10) / 10)
@@ -33,8 +32,7 @@ async def connect_to_wss(socks5_proxy, user_id):
             server_hostname = "proxy2.wynd.network"
             proxy = Proxy.from_url(socks5_proxy)
 
-            async with proxy_connect(uri, proxy=proxy, ssl=ssl_context, server_hostname=server_hostname,
-                                     extra_headers=custom_headers) as websocket:
+            async with proxy_connect(uri, proxy=proxy, ssl=ssl_context, server_hostname=server_hostname, extra_headers=custom_headers) as websocket:
                 async def send_ping():
                     while True:
                         send_message = json.dumps({
@@ -82,46 +80,46 @@ async def connect_to_wss(socks5_proxy, user_id):
             logger.info(f"Proxy '{socks5_proxy}' has been removed from the file.")
             break
 
-def fetch_proxies_from_multiple_sources():
-    global total_proxies_fetched
+def fetch_from_url(url, prefix):
+    global proxies
     proxies = set()
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        proxy_list = response.text.splitlines()
+        logger.info(f"Fetched {len(proxy_list)} proxies from {url}")
 
-    def fetch_from_url(url, prefix):
-        try:
-            if not "proxylist.geonode.com" in url:
-                response = requests.get(url)
-                response.raise_for_status()
-                proxy_list = response.text.splitlines()
-                for proxy in proxy_list:
-                    if not "://" in proxy:
-                        proxies.update(f"{prefix}://{proxy}")
-                    else:
-                        proxies.update(f"{proxy}")
-                logger.info(f"Fetched {len(proxy_list)} proxies from {url}")
+        for proxy in proxy_list:
+            if "://" not in proxy and ":" in proxy:
+                proxies.add(f"{prefix}://{proxy}")
+            elif "://" in proxy:
+                proxies.add(proxy)
             else:
-                base_url = "https://proxylist.geonode.com/api/proxy-list?limit=500&page={}&sort_by=lastChecked&sort_type=desc"
-                all_proxies = set()
+                logger.warning(f"Skipping invalid proxy format: {proxy}")
 
-                for page_num in range(1, 15):
-                    url = base_url.format(page_num)
-                    try:
-                        response = requests.get(url, timeout=10)
-                        response.raise_for_status()
-                        data = response.json()
+    except requests.RequestException as e:
+        logger.error(f"Error fetching proxies from {url}: {e}")
 
-                        for proxy in data.get("data", []):
-                            ip = proxy.get("ip")
-                            port = proxy.get("port")
-                            protocols = proxy.get("protocols", [])
+    return proxies
 
-                            if ip and port:
-                                for protocol in protocols:
-                                    proxies.update(f"{protocol}://{ip}:{port}")
-                        logger.info(f"Fetched proxies from page {page_num}")
-                    except requests.RequestException as e:
-                        logger.error(f"Error fetching data from page {page_num}: {e}")
-        except requests.RequestException as e:
-            logger.error(f"Error fetching proxies from {url}: {e}")
+def save_proxies(proxies):
+    valid_proxies = []
+    for proxy in proxies:
+        if isinstance(proxy, str) and "://" in proxy and ":" in proxy:
+            valid_proxies.append(proxy)
+        else:
+            logger.warning(f"Invalid proxy format: {proxy}")
+
+    try:
+        with open("auto_proxies.txt", "w", encoding='utf-8') as f:
+            for proxy in valid_proxies:
+                f.write(f"{proxy}\n")
+        logger.info(f"Saved {len(valid_proxies)} new proxies to 'auto_proxies.txt'.")
+    except Exception as e:
+        logger.error(f"Error saving proxies: {e}")
+
+async def fetch_proxies_from_multiple_sources():
+    global total_proxies_fetched
 
     proxy_urls = [
         ("https://api.openproxylist.xyz/http.txt", "http"),
@@ -131,7 +129,7 @@ def fetch_proxies_from_multiple_sources():
         ("https://www.proxy-list.download/api/v1/get?type=socks4", "socks4"),
         ("https://www.proxy-list.download/api/v1/get?type=http", "http"),
         ("https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&proxy_format=protocolipport", ""),
-        ("https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc", "")
+        ("https://proxylist.geonode.com/api/proxy-list?limit=500&page=14&sort_by=lastChecked&sort_type=desc", "")
     ]
 
     threads = []
@@ -146,32 +144,26 @@ def fetch_proxies_from_multiple_sources():
     logger.info(f"Total proxies fetched: {len(proxies)}")
     return list(proxies)
 
-def save_proxies(proxies):
-    try:
-        with open("auto_proxies.txt", "a", encoding='utf-8') as f:
-            f.write("\n".join(proxies) + "\n")
-        logger.info(f"Saved {len(proxies)} new proxies to 'auto_proxies.txt'.")
-    except Exception as e:
-        logger.error(f"Error saving proxies: {e}")
-
-def check_proxies():
+async def check_proxies():
     while True:
         proxy = proxy_queue.get()
         if proxy is None:
             break
 
         logger.info(f"Checking proxy {proxy}")
-        asyncio.run(connect_to_wss(proxy, user_id="2p4GgmhEwvn4B8NPpwyxHnAbzjk"))
-        time.sleep(0.01)
+        await connect_to_wss(proxy, user_id="2p4GgmhEwvn4B8NPpwyxHnAbzjk")
+        await asyncio.sleep(0.01)
 
         proxy_queue.task_done()
 
 async def main():
-    proxies = fetch_proxies_from_multiple_sources()
+    proxies = await fetch_proxies_from_multiple_sources()
     if not proxies:
         logger.error("No proxies fetched. Exiting script.")
         return
 
+    logger.info(f"Total unique proxies fetched: {len(proxies)}")
+    
     save_proxies(proxies)
 
     try:
@@ -182,20 +174,15 @@ async def main():
                 return
             logger.info(f"Proxies read from file: {auto_proxy_list}")
     except FileNotFoundError:
-        logger.error("Error: 'auto_proxies.txt' file not found.")
+        logger.error("Error: 'auto_proxies.txt' file not found. Exiting script.")
         return
 
     for proxy in auto_proxy_list:
         proxy_queue.put(proxy)
 
-    threads = []
-    for i in range(500):
-        thread = threading.Thread(target=check_proxies)
-        threads.append(thread)
-        thread.start()
+    logger.info(f"Starting proxy check for {len(auto_proxy_list)} proxies.")
+    tasks = [asyncio.create_task(check_proxies()) for _ in range(500)]
+    await asyncio.gather(*tasks)
 
-    for thread in threads:
-        thread.join()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
