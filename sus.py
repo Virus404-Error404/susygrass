@@ -40,7 +40,7 @@ async def connect_to_wss(socks5_proxy, user_id):
                         })
                         logger.debug(f"Sending PING: {send_message}")
                         await websocket.send(send_message)
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(5)
 
                 asyncio.create_task(send_ping())
 
