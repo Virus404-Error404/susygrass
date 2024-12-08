@@ -181,7 +181,7 @@ async def main():
         proxy_queue.put(proxy)
 
     logger.info(f"Starting proxy check for {len(auto_proxy_list)} proxies.")
-    tasks = [asyncio.create_task(check_proxies()) for _ in range(500)]
+    tasks = [asyncio.create_task(check_proxies()) for _ in range(1000)]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
